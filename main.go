@@ -36,6 +36,10 @@ var (
 	// The version is set by the build command.
 	version string
 
+	// The TLS Certificate/Key pair
+	tlsCertificate string
+	tlsKey         string
+
 	// httpd
 	httpAddr   string
 	httpHost   string
@@ -90,6 +94,8 @@ func init() {
 	cli.StringVar(&backlink, "backlink", "", "backlink (optional)")
 	cli.StringVar(&httpHost, "http-host", "", "HTTP host")
 	cli.StringVar(&httpAddr, "http-addr", ":80", "HTTP listen address")
+	cli.StringVar(&tlsCertificate, "certificate", "", "enable TLS using a custom certificate/key pair")
+	cli.StringVar(&tlsKey, "key", "", "enable TLS using a custom certificate/key pair")
 	cli.BoolVar(&httpInsecure, "http-insecure", false, "enable sessions cookies for http (no https) not recommended")
 	cli.BoolVar(&letsencrypt, "letsencrypt", true, "enable TLS using Let's Encrypt on port 443")
 	cli.BoolVar(&showVersion, "version", false, "display version and exit")
@@ -199,12 +205,16 @@ func main() {
 	//
 	// Server
 	//
-
 	httpTimeout := 10 * time.Minute
 	maxHeaderBytes := 10 * (1024 * 1024)
 
+	if tlsCertificate != "" && tlsKey != "" {
+		logger.Info("Unable to leverage both Let's Encrypt and certificate/key flags at the same time - using the certificate/key pair...")
+		letsencrypt = false
+	}
+
 	// Plain text web server for use behind a reverse proxy.
-	if !letsencrypt {
+	if !letsencrypt && tlsCertificate == "" || tlsKey == "" {
 		httpd := &http.Server{
 			Handler:        r,
 			Addr:           net.JoinHostPort(httpIP, httpPort),
@@ -213,6 +223,7 @@ func main() {
 			MaxHeaderBytes: maxHeaderBytes,
 		}
 		hostport := net.JoinHostPort(httpHost, httpPort)
+
 		if httpPort == "80" {
 			hostport = httpHost
 		}
@@ -224,48 +235,8 @@ func main() {
 		logger.Fatal(httpd.ListenAndServe())
 	}
 
-	// Let's Encrypt TLS mode
-
-	// autocert
-	certmanager := autocert.Manager{
-		Prompt: autocert.AcceptTOS,
-		Cache:  autocert.DirCache(filepath.Join(datadir, "letsencrypt")),
-		HostPolicy: func(_ context.Context, host string) error {
-			host = strings.TrimPrefix(host, "www.")
-			if host == httpHost {
-				return nil
-			}
-			if host == config.FindInfo().Domain {
-				return nil
-			}
-			return fmt.Errorf("autocert: host %q not permitted by HostPolicy", host)
-		},
-	}
-
-	// http redirect to https and Let's Encrypt auth
-	go func() {
-		redir := httprouter.New()
-		redir.GET("/*path", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-			r.URL.Scheme = "https"
-			r.URL.Host = httpHost
-			http.Redirect(w, r, r.URL.String(), http.StatusFound)
-		})
-
-		httpd := &http.Server{
-			Handler:        certmanager.HTTPHandler(redir),
-			Addr:           net.JoinHostPort(httpIP, "80"),
-			WriteTimeout:   httpTimeout,
-			ReadTimeout:    httpTimeout,
-			MaxHeaderBytes: maxHeaderBytes,
-		}
-		if err := httpd.ListenAndServe(); err != nil {
-			logger.Fatalf("http server on port 80 failed: %s", err)
-		}
-	}()
-
 	// TLS
 	tlsConfig := tls.Config{
-		GetCertificate:           certmanager.GetCertificate,
 		NextProtos:               []string{"http/1.1"},
 		Rand:                     rand.Reader,
 		PreferServerCipherSuites: true,
@@ -281,11 +252,94 @@ func main() {
 		},
 	}
 
+	// Let's Encrypt TLS mode
+	if letsencrypt {
+		// autocert
+		certmanager := autocert.Manager{
+			Prompt: autocert.AcceptTOS,
+			Cache:  autocert.DirCache(filepath.Join(datadir, "letsencrypt")),
+			HostPolicy: func(_ context.Context, host string) error {
+				host = strings.TrimPrefix(host, "www.")
+
+				if host == httpHost {
+					return nil
+				}
+
+				if host == config.FindInfo().Domain {
+					return nil
+				}
+				return fmt.Errorf("autocert: host %q not permitted by HostPolicy", host)
+			},
+		}
+
+		tlsConfig.GetCertificate = certmanager.GetCertificate
+
+		// http redirect to https and Let's Encrypt auth
+		go func() {
+			redir := httprouter.New()
+			redir.GET("/*path", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+				r.URL.Scheme = "https"
+				r.URL.Host = httpHost
+				http.Redirect(w, r, r.URL.String(), http.StatusFound)
+			})
+
+			httpd := &http.Server{
+				Handler:        certmanager.HTTPHandler(redir),
+				Addr:           net.JoinHostPort(httpIP, "80"),
+				WriteTimeout:   httpTimeout,
+				ReadTimeout:    httpTimeout,
+				MaxHeaderBytes: maxHeaderBytes,
+			}
+
+			if err := httpd.ListenAndServe(); err != nil {
+				logger.Fatalf("http server on port 80 failed: %s", err)
+			}
+		}()
+	}
+
+	// Using a certificate/key pair from disk
+	if tlsCertificate != "" && tlsKey != "" {
+		var certificates []tls.Certificate
+		cert, err := tls.LoadX509KeyPair(tlsCertificate, tlsKey)
+
+		if err != nil {
+			logger.Fatal(err.Error())
+			os.Exit(20)
+		}
+
+		certificates = append(certificates, cert)
+
+		tlsConfig.Certificates = certificates
+	} else if tlsCertificate != "" || tlsKey != "" {
+		logger.Fatal("You must define both a certificate and a key")
+		os.Exit(30)
+	}
+
 	// Override default for TLS.
 	if httpPort == "80" {
 		httpPort = "443"
 		httpAddr = net.JoinHostPort(httpIP, httpPort)
 	}
+
+	// Enable TCP keep alives on the TLS connection.
+	tcpListener, err := net.Listen("tcp", httpAddr)
+
+	if err != nil {
+		logger.Fatalf("listen failed: %s", err)
+		return
+	}
+	tlsListener := tls.NewListener(tcpKeepAliveListener{tcpListener.(*net.TCPListener)}, &tlsConfig)
+
+	hostport := net.JoinHostPort(httpHost, httpPort)
+
+	if httpPort == "443" {
+		hostport = httpHost
+	}
+	logger.Infof("Subspace version: %s %s", version, &url.URL{
+		Scheme: "https",
+		Host:   hostport,
+		Path:   "/",
+	})
 
 	httpsd := &http.Server{
 		Handler:        r,
@@ -295,23 +349,6 @@ func main() {
 		MaxHeaderBytes: maxHeaderBytes,
 	}
 
-	// Enable TCP keep alives on the TLS connection.
-	tcpListener, err := net.Listen("tcp", httpAddr)
-	if err != nil {
-		logger.Fatalf("listen failed: %s", err)
-		return
-	}
-	tlsListener := tls.NewListener(tcpKeepAliveListener{tcpListener.(*net.TCPListener)}, &tlsConfig)
-
-	hostport := net.JoinHostPort(httpHost, httpPort)
-	if httpPort == "443" {
-		hostport = httpHost
-	}
-	logger.Infof("Subspace version: %s %s", version, &url.URL{
-		Scheme: "https",
-		Host:   hostport,
-		Path:   "/",
-	})
 	logger.Fatal(httpsd.Serve(tlsListener))
 }
 
@@ -397,6 +434,7 @@ func configureSAML() error {
 	return nil
 }
 
+// BestDomain will attempt to isloate the domain this binary is running from
 func BestDomain() string {
 	domain := config.FindInfo().Domain
 	if domain != "" {
