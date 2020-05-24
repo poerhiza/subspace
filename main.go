@@ -94,8 +94,8 @@ func init() {
 	cli.StringVar(&backlink, "backlink", "", "backlink (optional)")
 	cli.StringVar(&httpHost, "http-host", "", "HTTP host")
 	cli.StringVar(&httpAddr, "http-addr", ":80", "HTTP listen address")
-	cli.StringVar(&tlsCertificate, "certificate", "", "enable TLS using a custom certificate/key pair")
-	cli.StringVar(&tlsKey, "key", "", "enable TLS using a custom certificate/key pair")
+	cli.StringVar(&tlsCertificate, "tls-certificate", "", "enable TLS using a custom certificate/key pair")
+	cli.StringVar(&tlsKey, "tls-key", "", "enable TLS using a custom certificate/key pair")
 	cli.BoolVar(&httpInsecure, "http-insecure", false, "enable sessions cookies for http (no https) not recommended")
 	cli.BoolVar(&letsencrypt, "letsencrypt", true, "enable TLS using Let's Encrypt on port 443")
 	cli.BoolVar(&showVersion, "version", false, "display version and exit")
@@ -209,12 +209,12 @@ func main() {
 	maxHeaderBytes := 10 * (1024 * 1024)
 
 	if tlsCertificate != "" && tlsKey != "" {
-		logger.Info("Unable to leverage both Let's Encrypt and certificate/key flags at the same time - using the certificate/key pair...")
+		logger.Warn("Found TLS Certificate and Key disabling Let's encrypt")
 		letsencrypt = false
 	}
 
 	// Plain text web server for use behind a reverse proxy.
-	if !letsencrypt && tlsCertificate == "" || tlsKey == "" {
+	if !letsencrypt && (tlsCertificate == "" || tlsKey == "") {
 		httpd := &http.Server{
 			Handler:        r,
 			Addr:           net.JoinHostPort(httpIP, httpPort),
@@ -304,7 +304,6 @@ func main() {
 
 		if err != nil {
 			logger.Fatal(err.Error())
-			os.Exit(20)
 		}
 
 		certificates = append(certificates, cert)
@@ -312,7 +311,6 @@ func main() {
 		tlsConfig.Certificates = certificates
 	} else if tlsCertificate != "" || tlsKey != "" {
 		logger.Fatal("You must define both a certificate and a key")
-		os.Exit(30)
 	}
 
 	// Override default for TLS.
