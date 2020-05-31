@@ -48,10 +48,6 @@ var (
 	// Insecure http cookies (only recommended for internal LANs/VPNs)
 	httpInsecure bool
 
-	// set based on httpAddr
-	httpIP   string
-	httpPort string
-
 	// backlink
 	backlink string
 
@@ -66,9 +62,6 @@ var (
 
 	// Let's Encrypt
 	letsencrypt bool
-
-	// HTTP read limit
-	httpReadLimit int64 = 2 * (1024 * 1024)
 
 	// securetoken
 	securetoken *securecookie.SecureCookie
@@ -430,13 +423,4 @@ func configureSAML() error {
 	samlSP = newsp
 	logger.Infof("successfully configured SAML")
 	return nil
-}
-
-// BestDomain will attempt to isloate the domain this binary is running from
-func BestDomain() string {
-	domain := config.FindInfo().Domain
-	if domain != "" {
-		return domain
-	}
-	return httpHost
 }
